@@ -130,18 +130,15 @@ def _zig_repository_impl(repository_ctx):
     }.items():
         repository_ctx.symlink(Label(src), dest)
 
-    for dest, src in {
-        "BUILD": "//toolchain:BUILD.sdk.bazel",
-    }.items():
-        repository_ctx.template(
-            dest,
-            Label(src),
-            executable = False,
-            substitutions = {
-                "{zig_sdk_path}": _quote("external/zig_sdk"),
-                "{os}": _quote(os),
-            },
-        )
+    repository_ctx.template(
+        "BUILD",
+        Label("//toolchain:BUILD.sdk.bazel"),
+        executable = False,
+        substitutions = {
+            "{zig_sdk_path}": _quote("external/zig_sdk"),
+            "{os}": _quote(os),
+        },
+    )
 
     urls = [uf.format(**format_vars) for uf in repository_ctx.attr.url_formats]
     repository_ctx.download_and_extract(
@@ -151,34 +148,26 @@ def _zig_repository_impl(repository_ctx):
         sha256 = zig_sha256,
     )
 
-    cache_prefix = repository_ctx.os.environ.get("HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX", "")
-    if cache_prefix == "":
-        if os == "windows":
-            cache_prefix = "C:\\\\Temp\\\\hermetic_cc_toolchain"
-        else:
-            cache_prefix = "/tmp/zig-cache"
+    repository_ctx.file(
+        "tools/build-zig-wrapper.sh",
+        content = """
+#!/bin/bash
 
-    repository_ctx.template(
-        "tools/zig-wrapper.zig",
-        Label("//toolchain:zig-wrapper.zig"),
-        executable = False,
-        substitutions = {
-            "{HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX}": cache_prefix,
-        },
+TMP_DIR=$(mktemp -d -t hermetic_cc_toolchain.XXXXXX)
+trap "rm -rf $TMP_DIR" EXIT
+
+ZIG_LOCAL_CACHE_DIR=$TMP_DIR
+ZIG_GLOBAL_CACHE_DIR=$TMP_DIR
+
+{zig} build-exe -fstrip -mcpu={mcpu} -OReleaseSafe {wrapper} {static}
+""".format(
+            zig = _paths_join("..", "zig"),
+            mcpu = _MCPU[host_platform],
+            wrapper = repository_ctx.path(Label("//toolchain:zig-wrapper.zig")),
+            static = "-static" if os == "linux" else "",
+        ),
+        executable = True,
     )
-
-    compile_env = {
-        "ZIG_LOCAL_CACHE_DIR": cache_prefix,
-        "ZIG_GLOBAL_CACHE_DIR": cache_prefix,
-    }
-    compile_cmd = [
-        _paths_join("..", "zig"),
-        "build-exe",
-        "-fstrip",
-        "-mcpu={}".format(_MCPU[host_platform]),
-        "-OReleaseSafe",
-        "zig-wrapper.zig",
-    ] + (["-static"] if os == "linux" else [])
 
     # The elaborate code below is a workaround for ziglang/zig#14978: a race in
     # Windows where zig may error with `error: AccessDenied`.
@@ -189,9 +178,8 @@ def _zig_repository_impl(repository_ctx):
             print("Launcher compilation failed. Retrying build")
 
         ret = repository_ctx.execute(
-            compile_cmd,
+            ["./build-zig-wrapper.sh"],
             working_directory = "tools",
-            environment = compile_env,
         )
 
         if ret.return_code == 0:
@@ -199,13 +187,11 @@ def _zig_repository_impl(repository_ctx):
             break
 
         zig_wrapper_success = False
-        full_cmd = [k + "=" + v for k, v in compile_env.items()] + compile_cmd
         zig_wrapper_err_msg = _compile_failed.format(
-            compile_cmd = " ".join(full_cmd),
+            compile_cmd = "build-zig-wrapper.sh",
             return_code = ret.return_code,
             stdout = ret.stdout,
             stderr = ret.stderr,
-            cache_prefix = cache_prefix,
         )
 
     if not zig_wrapper_success:

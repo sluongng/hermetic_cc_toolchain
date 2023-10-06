@@ -53,6 +53,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fs = std.fs;
+const os = std.os;
 const mem = std.mem;
 const process = std.process;
 const ChildProcess = std.ChildProcess;
@@ -63,8 +64,6 @@ const EXE = switch (builtin.target.os.tag) {
     .windows => ".exe",
     else => "",
 };
-
-const CACHE_DIR = "{HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX}";
 
 const usage =
     \\
@@ -82,9 +81,22 @@ const Action = enum {
     exec,
 };
 
+const zig_cache_dir = "zig-cache";
+const rand_bytes_count = 12;
+const tmp_sub_path_len = fs.base64_encoder.calcSize(rand_bytes_count);
+
 const ExecParams = struct {
     args: ArrayListUnmanaged([]const u8),
     env: process.EnvMap,
+    tmp_dir: ?[]u8,
+
+    pub fn cleanup(self: ExecParams) void {
+        if (self.tmp_dir) |td| {
+            fs.deleteTreeAbsolute(td) catch |err| {
+                std.debug.print("error deleting {s}: {s}\n", .{ td, @errorName(err) });
+            };
+        }
+    }
 };
 
 const ParseResults = union(Action) {
@@ -129,22 +141,29 @@ pub fn main() u8 {
     switch (action) {
         .err => |msg| return fatal("{s}", .{msg}),
         .exec => |params| {
-            if (builtin.os.tag == .windows)
-                return spawnWindows(arena, params)
-            else
+            if (builtin.os.tag == .windows) {
+                return spawnWithChildProc(arena, params);
+            } else if (params.tmp_dir) |_| {
+                return spawnWithChildProc(arena, params);
+            } else {
                 return execUnix(arena, params);
+            }
         },
     }
 }
 
-fn spawnWindows(arena: mem.Allocator, params: ExecParams) u8 {
+fn spawnWithChildProc(arena: mem.Allocator, params: ExecParams) u8 {
     var proc = ChildProcess.init(params.args.items, arena);
     proc.env_map = &params.env;
-    const ret = proc.spawnAndWait() catch |err|
+
+    const ret = proc.spawnAndWait() catch |err| {
+        params.cleanup();
         return fatal(
-        "error spawning {s}: {s}\n",
-        .{ params.args.items[0], @errorName(err) },
-    );
+            "error spawning {s}: {s}\n",
+            .{ params.args.items[0], @errorName(err) },
+        );
+    };
+    params.cleanup();
 
     switch (ret) {
         .Exited => |code| return code,
@@ -152,6 +171,9 @@ fn spawnWindows(arena: mem.Allocator, params: ExecParams) u8 {
     }
 }
 
+// execUnix execs a process by replacing the current process, effectively
+// stopping the execution of the current process completely. If successful,
+// this function will not return. Neither do subsequent cleanup / defer logic.
 fn execUnix(arena: mem.Allocator, params: ExecParams) u8 {
     const err = process.execve(arena, params.args.items, &params.env);
     std.debug.print(
@@ -217,9 +239,49 @@ fn parseArgs(
     var env = process.getEnvMap(arena) catch |err|
         return parseFatal(arena, "error getting env: {s}", .{@errorName(err)});
 
+    var tmp_dir: ?[]u8 = null;
+    // If $HOME is set, use a consistent path in $HOME/.cache/zig-cache
+    // Otherwise, use a random path in /tmp/zig-cache
+    const cache_dir = if (os.getenv("HOME")) |home|
+        fs.path.join(
+            arena,
+            &[_][]const u8{ home, ".cache", zig_cache_dir },
+        ) catch |err|
+            return parseFatal(arena, "error getting home dir: {s}", .{@errorName(err)})
+    else blk: {
+        var random_bytes: [rand_bytes_count]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+
+        var sub_path: [tmp_sub_path_len]u8 = undefined;
+        _ = fs.base64_encoder.encode(&sub_path, &random_bytes);
+
+        var zig_cache_path = fs.path.join(
+            arena,
+            &[_][]const u8{ "/tmp", zig_cache_dir },
+        ) catch |err|
+            return parseFatal(arena, "error getting zig_cache dir: {s}", .{@errorName(err)});
+        fs.makeDirAbsolute(zig_cache_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return parseFatal(arena, "error making zig-cache dir: {s}", .{@errorName(err)}),
+        };
+
+        var tmp_path = fs.path.join(
+            arena,
+            &[_][]const u8{ zig_cache_path, &sub_path },
+        ) catch |err|
+            return parseFatal(arena, "error getting tmp dir: {s}", .{@errorName(err)});
+        fs.makeDirAbsolute(tmp_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return parseFatal(arena, "error making {s} dir: {s}", .{ tmp_path, @errorName(err) }),
+        };
+
+        tmp_dir = tmp_path;
+        break :blk tmp_path;
+    };
+
     try env.put("ZIG_LIB_DIR", zig_lib_dir);
-    try env.put("ZIG_LOCAL_CACHE_DIR", CACHE_DIR);
-    try env.put("ZIG_GLOBAL_CACHE_DIR", CACHE_DIR);
+    try env.put("ZIG_LOCAL_CACHE_DIR", cache_dir);
+    try env.put("ZIG_GLOBAL_CACHE_DIR", cache_dir);
 
     // args is the path to the zig binary and args to it.
     var args = ArrayListUnmanaged([]const u8){};
@@ -238,7 +300,7 @@ fn parseArgs(
     while (argv_it.next()) |arg|
         try args.append(arena, arg);
 
-    return ParseResults{ .exec = .{ .args = args, .env = env } };
+    return ParseResults{ .exec = .{ .args = args, .env = env, .tmp_dir = tmp_dir } };
 }
 
 fn parseFatal(
